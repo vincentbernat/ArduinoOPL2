@@ -1,5 +1,6 @@
 import struct
 import time
+import threading
 
 import serial
 
@@ -15,8 +16,8 @@ class ArduinoOpl:
   def __init__(self, portname, baudrate=115200, debug=False):
     self.port = serial.Serial(portname, baudrate, timeout=None)
     self.ready = False
-    self.n_outstanding = 0
     self.debug = debug
+    self.buffer_size = 0
 
     # Delay estimation
     self.started = None
@@ -29,11 +30,25 @@ class ArduinoOpl:
     self._debug('Tx: %s' % self.READY_CMD)
     self.port.write(self.READY_CMD)
     opl_rx_buf_bytes = int(self.port.readline())
+    self.buffer_size = opl_rx_buf_bytes // self.BINARY_CMD_SIZE
     self._debug('Rx buffer size: %d bytes' % opl_rx_buf_bytes)
-    self.max_write_ahead = opl_rx_buf_bytes // self.BINARY_CMD_SIZE
     self._status(self.READY_CMD)
 
+    self.sem = threading.Semaphore(self.buffer_size)
+    self.ack_thread = threading.Thread(target=self.ack)
+    self.ack_thread.daemon = True
+    self.ack_thread.start()
+
     self.ready = True
+
+  def ack(self):
+    while True:
+      rsp = self.port.read()
+      if rsp == '':
+        break
+      if rsp != self.ACK_RSP:
+        raise RuntimeError('Expected: %s, received: %s' % (rsp, self.ACK_RSP))
+      self.sem.release()
 
   def wait_for_rsp(self, rsp):
     self._debug('Awaiting: %s' % rsp)
@@ -43,11 +58,7 @@ class ArduinoOpl:
       raise RuntimeError('Expected: %s, received: %s' % (rsp, rx))
 
   def write_reg(self, addr, data, delay_us=0, predelay=False):
-    if self.n_outstanding >= self.max_write_ahead:
-      rsp = self.port.read()
-      if rsp != self.ACK_RSP:
-        raise RuntimeError('Expected: %s, received: %s' % (rsp, self.ACK_RSP))
-      self.n_outstanding -= 1
+    self.sem.acquire()
     self.write_reg_unbuffered(addr, data, delay_us, predelay)
 
   def write_reg_unbuffered(self, addr, data, delay_us, predelay):
@@ -58,7 +69,6 @@ class ArduinoOpl:
       delay_ms = -delay_ms
 
     cmd = struct.pack('!BBhB', addr, data, delay_ms, delay_remainder // 4)
-    self.n_outstanding += 1
     self.port.write(cmd)
     self._debug('Tx: %s' % ['%02x' % b for b in cmd])
     if delay_us > 0:
@@ -77,11 +87,11 @@ class ArduinoOpl:
       if delay > 0 and elapsed > 50:
         self.underflows += 1
     status_str = ("STATUS %-12s  "
-                  "BUFFERED: %5d  "
+                  "BUFFER: %5d  "
                   "DELAY: %8.2fms  "
                   "UNDERFLOWS: %2d   "
                   "%s") % (status,
-                           self.n_outstanding,
+                           self.buffer_size,
                            delay,
                            self.underflows,
                            tx_txt)
